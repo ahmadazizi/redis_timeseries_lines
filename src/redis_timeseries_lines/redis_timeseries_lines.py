@@ -32,8 +32,8 @@ class RedisTimeseriesLines:
     This class can be used within context manager.
     """
     _name = None
-    _lines = None
-    _timeframes = None
+    _lines = []
+    _timeframes = {}
 
     def __init__(
             self,
@@ -69,6 +69,10 @@ class RedisTimeseriesLines:
 
     def get_lines(self):
         return self._lines
+    
+
+    def get_timeframes(self):
+        return list(self._timeframes.keys())
 
 
     def create(self, c1:str, c2:str):
@@ -96,7 +100,7 @@ class RedisTimeseriesLines:
                     'line': line,
                     'timeframe':tf_name
                 }
-                self._create_ts(key_name, tf_specs['retention_seconds'], 'last', labels)
+                self._create_ts(key_name, tf_specs['retention_secs'], 'last', labels)
 
 
     def _iter_rules(self, c1:str, c2:str, new_line:str=None):
@@ -283,15 +287,15 @@ class RedisTimeseriesLines:
             return False, str(e)
 
 
-    def add(self, data:list, c1:str, timeframe:str=None, c2:str=None, c2_position:int=None, create_inplace:bool=False):
+    def add(self, data:list, c1:str, c2:str=None, c2_position:int=None, timeframe:str=None, create_inplace:bool=False):
         """Add data records
             If c2 is not provided, it means that it resides inside the data at position `c2_position`
         Args:
             data (list): list of lists containing data. Each inner list is as [timestamp, [c2], line1, line2, ...]
             c1 (str): classifier 1
-            timeframe (str, optional): timeframe. Defaults to 1st timeframe.
             c2 (str, optional): classifier 2. If c2 is not provided, it means that it resides inside data at position `c2_position`
             c2_position (int, optional): position of c2 inside data. Must be provided if c2 is not provided.
+            timeframe (str, optional): timeframe. Defaults to 1st(shortest) timeframe. Please note that you shouldn't add data directly to `compressed` timeframes. So using this parameter is prohibited.
             create_inplace (bool, optional): Create ts map if does not exist. Defaults to False.
         Returns:
             tuple: (success:bool, insertedDataLength:int or error:str)
@@ -326,7 +330,7 @@ class RedisTimeseriesLines:
             return False, message
 
 
-    def read(self, c1:str, c2:str, timeframe:str=None, from_timestamp:int=0, to_timestamp:int=None, extra_bars:int=None, timestamp_minimum_boundary:int=None):
+    def read(self, c1:str, c2:str, timeframe:str=None, from_timestamp:int=0, to_timestamp:int=None, extra_records:int=None, timestamp_minimum_boundary:int=None):
         """Read records based on conditions
         Args:
             c1 (str): c1
@@ -334,8 +338,8 @@ class RedisTimeseriesLines:
             timeframe (str, optional): timeframe. Defaults to 1st timeframe.
             from_timestamp (int, optional): Defaults to 0.
             to_timestamp (int, optional): Defaults to timestamp of current time.
-            extra_bars (int, optional): Number of extra bars before from_timestamp. Defaults to None. [THIS FEATURE IS EXPERIMENTAL]
-            timestamp_minimum_boundary (int, optional): When extra_bars set, this limits how much from_timestamp can decline. Defaults to None. [THIS FEATURE IS EXPERIMENTAL]
+            extra_records (int, optional): Number of extra_records before from_timestamp. Defaults to None. [THIS FEATURE IS EXPERIMENTAL]
+            timestamp_minimum_boundary (int, optional): When extra_records set, this limits how much from_timestamp can decline. Defaults to None. [THIS FEATURE IS EXPERIMENTAL]
         Returns:
             list: list of tuples as (`timestamp(secs)`, `line1`, `line2`, ...)
         """
@@ -347,9 +351,9 @@ class RedisTimeseriesLines:
         to_timestamp = to_timestamp * 1000
         from_timestamp = from_timestamp * 1000
         try:
-            if extra_bars:
+            if extra_records:
                 adjust_key_name = self._get_key_name(c1, c2, timeframe, list(self._timeframes.keys()))[0]
-                from_timestamp = self._adjust_from_timestamp(adjust_key_name, from_timestamp, extra_bars, timestamp_minimum_boundary)
+                from_timestamp = self._adjust_from_timestamp(adjust_key_name, from_timestamp, extra_records, timestamp_minimum_boundary)
             raw = {}
             prev_dt = None
             for line in self._lines:
@@ -378,7 +382,7 @@ class RedisTimeseriesLines:
             n (int): The number of required records
             minimum_timestamp (int, optional): The minimum timestap(secs) of valid record. If not provided, an optimized value will be chosen based on timeframe.
         Returns:
-            tuple: success(bool), bars_are_enough(bool), records(list)
+            tuple: success(bool), records_are_enough(bool), records(list)
             records is list of tuples as (`timestamp(secs)`, `line1`, `line2`, ...)
         """
         c1 = c1.lower()
@@ -387,7 +391,7 @@ class RedisTimeseriesLines:
         to_timestamp = int(time.time()) * 1000
         minimum_timestamp = minimum_timestamp * 1000 if minimum_timestamp != None else self._get_optimized_from_timestamp(timeframe, n)
         #output vars
-        bars_are_enough = False
+        records_are_enough = False
         try:
             adjust_key_name = self._get_key_name(c1, c2, timeframe, self._lines[0])
             #the ts function immediately raises exception in case of error. e.g. key not found
@@ -400,7 +404,7 @@ class RedisTimeseriesLines:
             data_count = len(result)
             if data_count < 1:
                 return True, False, []
-            bars_are_enough = True if data_count == n else False
+            records_are_enough = True if data_count == n else False
             from_timestamp = result[-1][0]
             # everything is ready to fetch actual data
             raw = {}
@@ -417,7 +421,7 @@ class RedisTimeseriesLines:
             output = self._prepare_raw_results(raw)
             if not output[0]:
                 raise Exception(output[1])
-            return True, bars_are_enough, output[1]
+            return True, records_are_enough, output[1]
         except Exception as e:
             return False, str(e)
 
@@ -560,8 +564,8 @@ class RedisTimeseriesLines:
             return False, str(e)
 
 
-    def _adjust_from_timestamp(self, key_name:str, from_timestamp:int, extra_bars:int=0, timestamp_minimum_boundary:int=None):
-        result = self.ts.revrange(key_name, 0, from_timestamp, count=extra_bars+1)
+    def _adjust_from_timestamp(self, key_name:str, from_timestamp:int, extra_records:int=0, timestamp_minimum_boundary:int=None):
+        result = self.ts.revrange(key_name, 0, from_timestamp, count=extra_records+1)
         if(len(result) == 0):
             return 0
         return result[-1][0]
@@ -630,14 +634,14 @@ class RedisTimeseriesLines:
     
 
     @staticmethod
-    def _get_optimized_from_timestamp(timeframe:str, bar_count:int):
+    def _get_optimized_from_timestamp(timeframe:str, record_count:int):
         days = 1
         if timeframe in ['raw', '1m']:
-            days = math.ceil(bar_count / 24) * 2
+            days = math.ceil(record_count / 24) * 2
         elif timeframe == '1h':
-            days = math.ceil(bar_count / 12) * 2
+            days = math.ceil(record_count / 12) * 2
         elif timeframe == '1d':
-            days = bar_count * 2
+            days = record_count * 2
         days = max(days, 5)
         initial_date = datetime.datetime.now()
         new_date = initial_date - datetime.timedelta(days=days)
